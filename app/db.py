@@ -3,6 +3,12 @@
 写路径均为“先算后写、单事务提交”：诊断先在内存中算完，再把
 登记/复测与诊断结果放进同一事务落库；任一步失败整体回滚，
 旧的读数与诊断原样保留。
+
+并发约定：
+  * WAL 模式 + busy_timeout，使读不阻塞写、不同班次的写互不阻塞；
+  * 写事务以 BEGIN IMMEDIATE 开启，直接获取保留写锁，杜绝锁升级死锁；
+  * 同班的写流程在 API 层由 ``app.locking.shift_write_lock`` 串行化，
+    保证诊断所用读数与事务内写入的复测一致。
 """
 from __future__ import annotations
 
@@ -12,6 +18,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 DB_PATH = os.environ.get("DATABASE_PATH", os.path.join("data", "app.db"))
+BUSY_TIMEOUT_MS = 10_000
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS registrations (
@@ -57,9 +64,13 @@ def _now() -> str:
 
 
 def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_MS / 1000.0,
+                           isolation_level=None)  # 显式事务控制
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
@@ -129,8 +140,14 @@ def list_shifts() -> list[str]:
 def save_registration_with_diagnosis(shift: str, ports: list[str],
                                      segments: list[dict], inputs: dict,
                                      result: dict) -> int:
-    """登记一班读数并连同诊断结果落库，返回诊断 id。"""
-    with _conn() as conn:
+    """登记一班读数并连同诊断结果落库，返回诊断 id。
+
+    全程在一个 BEGIN IMMEDIATE 事务内：任一步失败整体回滚，
+    本次读数与诊断都不会入库。
+    """
+    conn = _conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         cur = conn.execute(
             "INSERT INTO registrations(shift, ports_json, created_at) "
             "VALUES (?,?,?)", (shift, json.dumps(ports), _now()))
@@ -145,14 +162,27 @@ def save_registration_with_diagnosis(shift: str, ports: list[str],
             "result_json, created_at) VALUES (?,?,?,?,?)",
             (shift, reg_id, json.dumps(inputs, ensure_ascii=False),
              json.dumps(result, ensure_ascii=False), _now()))
-        return cur.lastrowid
+        diag_id = cur.lastrowid
+        conn.commit()
+        return diag_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def save_remeasures_with_diagnosis(shift: str, remeasures: list[dict],
                                    registration_id: int, inputs: dict,
                                    result: dict) -> int:
-    """补登复测区间并与新诊断同事务生效，返回诊断 id。"""
-    with _conn() as conn:
+    """补登复测区间并与新诊断同事务生效，返回诊断 id。
+
+    全程在一个 BEGIN IMMEDIATE 事务内：任一步失败整体回滚，
+    本次复测读数与诊断都不会入库。
+    """
+    conn = _conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         conn.executemany(
             "INSERT INTO remeasurements(shift, segment_key, rlo, rhi, "
             "created_at) VALUES (?,?,?,?,?)",
@@ -163,4 +193,11 @@ def save_remeasures_with_diagnosis(shift: str, remeasures: list[dict],
             "result_json, created_at) VALUES (?,?,?,?,?)",
             (shift, registration_id, json.dumps(inputs, ensure_ascii=False),
              json.dumps(result, ensure_ascii=False), _now()))
-        return cur.lastrowid
+        diag_id = cur.lastrowid
+        conn.commit()
+        return diag_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

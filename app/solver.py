@@ -66,21 +66,37 @@ def _solve(a: np.ndarray | None, lb: np.ndarray, ub: np.ndarray,
     raise SolverError(f"MILP 求解失败：status={res.status} {res.message}")
 
 
+def _has_empty_remeasure(segments: list[Segment],
+                         remeasure: dict[str, tuple[int, int]]) -> list[str]:
+    """返回交集为空（下界 > 上界）的复测管段 key。
+
+    复测读数本身仍由调用方原样保留入库；空交集只是让全网约束必然
+    不可行，诊断据此报账不平，并与“单表误差无法解释”区分开。
+    """
+    keys = {s.key for s in segments}
+    return sorted(k for k, (lo, hi) in remeasure.items()
+                  if k in keys and lo > hi)
+
+
 def diagnose(segments: list[Segment], ports: set[str],
              remeasure: dict[str, tuple[int, int]]) -> dict:
     """对一班登记数据做账平诊断。
 
-    remeasure: segment_key -> (下界, 上界)，调用前需保证 key 均存在。
+    remeasure: segment_key -> (下界, 上界)，调用前需保证 key 均存在；
+      同一管段多次复测的交集由调用方合并后传入，交集可能为空
+      （下界 > 上界），此时复测读数仍保留，但全网必然账不平。
     返回 dict：
       balanced=True  -> {"balanced": True, "assignment": {key: 流量}}
       balanced=False -> {"balanced": False, "suspects": [{segment_key,
-                          feasible_min, feasible_max}, ...]}
+                          feasible_min, feasible_max}, ...],
+                          "empty_remeasure": [segment_key, ...]}
     """
     n = len(segments)
     a = _balance_matrix(segments, ports)
     caps = np.array([s.capacity for s in segments], dtype=float)
     index = {s.key: i for i, s in enumerate(segments)}
     rem = [(index[k], float(lo), float(hi)) for k, (lo, hi) in remeasure.items()]
+    empty_keys = _has_empty_remeasure(segments, remeasure)
 
     def bounds(ignore: int | None) -> tuple[np.ndarray, np.ndarray]:
         lb = np.zeros(n)
@@ -104,6 +120,12 @@ def diagnose(segments: list[Segment], ports: set[str],
         return {"balanced": True,
                 "assignment": {s.key: int(v) for s, v in zip(segments, x)}}
 
+    if empty_keys:
+        # 复测区间交集为空：读数照常保留，但约束必然不可行，
+        # 不再枚举嫌疑表（没有任何一只表的原读数能解释矛盾）。
+        return {"balanced": False, "suspects": [],
+                "empty_remeasure": empty_keys}
+
     suspects = []
     for i, s in enumerate(segments):
         lb_i, ub_i = bounds(ignore=i)
@@ -118,4 +140,5 @@ def diagnose(segments: list[Segment], ports: set[str],
         suspects.append({"segment_key": s.key,
                          "feasible_min": int(x_min[i]),
                          "feasible_max": int(x_max[i])})
-    return {"balanced": False, "suspects": suspects}
+    return {"balanced": False, "suspects": suspects,
+            "empty_remeasure": []}
